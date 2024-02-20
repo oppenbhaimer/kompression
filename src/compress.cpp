@@ -2,8 +2,9 @@
 #include "crc.hpp"
 
 void test_crc32() {
-    std::string s = "Hello World";
+    std::string s = "123456789";
     uint32_t crc32 = crc_32(0xEDB88320UL, s.data(), (size_t)s.size(), 0xFFFFFFFFUL);
+    //uint32_t crc32 = crc32_fast(s.data(), (size_t)s.size());
     std::cout << std::hex << crc32 << std::dec << std::endl;
 }
 
