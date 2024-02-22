@@ -72,33 +72,11 @@ uint32_t crc_32(uint32_t P, char* M, size_t bufsize, uint32_t v) {
     // std::cout << std::dec;
     // std::cout << std::hex << std::setfill('0') << std::setw(8) << crc_table[0] << " " << crc_table[1] << " " << crc_table[2] << " " << crc_table[3] << std::dec << std::endl;
 
-    // let's not use v now
-    // uint32_t reg = v;
-    // we also don't care about where the message is put, so append zeros to 
-    // the end of M
-    // char *buf = new char[bufsize+4];
-    // buf[bufsize] = buf[bufsize+1] = buf[bufsize+2] = buf[bufsize+3] = 0;
-    // memcpy(buf, M, bufsize);
     uint32_t reg = 0xFFFFFFFFUL;
 
     for (int i=0; i<bufsize; i++) {
-        // uint32_t t = (reg>>24);
-        // uint32_t val = reverse(M[i], 8);
-        // reg ^= (((uint32_t)M[i]) << 24);
-        // reg <<= 8;
         reg = (reg<<8) ^ crc_table[(reg>>24) ^ reverse(M[i], 8)];
-        // size_t top = reg & 0xFF;
-        // reg = (reg>>8) | M[i];
-        // reg ^= crc_table[top];
     }
-    // reg ^= 0xFFFFFFFFUL;
-    // for (int i=0; i<4; i++) {
-    //     reg = (reg<<8) ^ crc_table[reg>>24];
-    // }
 
-    // delete[] buf;
-    // uint32_t rs = (reg<<24) | ((reg<<8)&0xFF0000) | ((reg>>8)&0xFF00) | (reg>>24);
-    // bit reflect
-    // return reverse(reg, 32)^0xFFFFFFFFUL;
     return ~reverse(reg, 32);
 }
