@@ -3,7 +3,8 @@
 #include <fstream>
 #include <chrono>
 
-constexpr int kDebugLevel = 0;
+constexpr int kDebugLevel = 2;
+constexpr int kMaxHuffCodeLength = 11;
 
 #define CHECK(cond) do{if(!(cond)){fprintf(stderr,"%s:%d CHECK %s\n", __FILE__, __LINE__, #cond);exit(1);}}while(0);
 #define LOGV(level, s, ...) do{if(level<=kDebugLevel) fprintf(stderr, s, ##__VA_ARGS__);}while(0);
@@ -113,6 +114,17 @@ class BitReader {
         }
     }
 
+    void byteAlign() {
+        int extra_bits = _position & 0x7;
+        if (extra_bits) {
+           readBits(8 - extra_bits);
+        }
+    }
+
+    uint32_t bits() const { return _bits; }
+    uint8_t* cursor() const { return _current - ((24 - _position) / 8); }
+    uint8_t* end() const {return _end; }
+
     private:
     uint8_t* _current;
     uint8_t* _end;
@@ -201,6 +213,35 @@ class HuffmanEncoder {
         walk(n->r, level+1);
     }
 
+    // heuristic-based length limiting. Perfect length limited coding would use 
+    // the package merge algorithm
+    // TODO implement package merge as an exercise
+    void limitLength(int num_symbols) {
+        int k = 0;
+        int maxk = (1 << kMaxHuffCodeLength) - 1;
+        // truncate code
+        for (int i = num_symbols-1; i>=0; i--) {
+            _nodes[i].freq = std::min(_nodes[i].freq, kMaxHuffCodeLength);
+            k += 1 << (kMaxHuffCodeLength - _nodes[i].freq);
+        }
+
+        // fixup - first pass
+        for (int i=num_symbols-1; i>=0 && k>maxk; i--) {
+            while (_nodes[i].freq < kMaxHuffCodeLength) {
+                _nodes[i].freq++;
+                k -= 1 << (kMaxHuffCodeLength - _nodes[i].freq);
+            }
+        }
+
+        // fixup - second pass (reduce error)
+        for (int i=0; i<num_symbols; i++) {
+            while (k + (1 << (kMaxHuffCodeLength - _nodes[i].freq)) <= maxk) {
+                k += 1 << (kMaxHuffCodeLength - _nodes[i].freq);
+                --_nodes[i].freq;
+            }
+        }
+    }
+
     void writeTable(int num_symbols) {
         const int kSymBits = log2(_max_symbols);
         _writer.writeBits(num_symbols-1, kSymBits);
@@ -275,7 +316,7 @@ class HuffmanEncoder {
         std::sort(&_nodes[0], &_nodes[num_symbols], 
                   [](const Node& l, const Node& r) { return l.freq < r.freq; });
 
-        // length limiting - maybe later?
+        limitLength(num_symbols);
         writeTable(num_symbols);
         buildCodes(num_symbols);
     }
@@ -297,6 +338,94 @@ class HuffmanEncoder {
 
 };
 
+class HuffmanDecoder {
+    public:
+
+    HuffmanDecoder(BitReader& reader): _reader(reader) {}
+
+    void readTable() {
+        _reader.refill();
+        _num_symbols = _reader.readBits(_sym_bits);
+
+        for (int i=0; i<_num_symbols; i++) {
+            _reader.refill();
+            int symbol = _reader.readBits(_sym_bits);
+            int codelen = _reader.readBits(4) + 1;
+            LOGV(2, "sym:%d len:%d\n", symbol, codelen);
+
+            _codelen_count[codelen]++;
+            _symbol_length[i] = codelen;
+            _symbol[i] = symbol;
+            _min_codelen = std::min(_min_codelen, codelen);
+            _max_codelen = std::max(_max_codelen, codelen);
+        }
+
+        LOGV(1, "num_sym %d codelen(min:%d max:%d)\n",
+                _num_symbols, _min_codelen, _max_codelen);
+        
+        _reader.byteAlign();
+    }
+
+    uint8_t decodeOne() {
+        _reader.refill();
+        int n = _reader.bits() >> (32 - _max_codelen);
+        int len = _bits_to_len[n];
+        _reader.readBits(len);
+        return _bits_to_sym[n];
+    }
+
+    void decode(uint8_t* output, uint8_t* output_end) {
+        uint8_t* src = _reader.cursor();
+        uint8_t* src_end = _reader.end();
+        int position = 24;
+        uint32_t bits = 0;
+
+        while (true) {
+            while (position >= 0) {
+                bits |= (src < src_end ? *src++ : 0) << position;
+                position -= 8;
+            }
+            int n = bits >> (32 - _max_codelen);
+            int len = _bits_to_len[n];
+            *output++ = _bits_to_sym[n];
+            if (output >= output_end) {
+                break;
+            }
+            bits <<= len;
+            position += len;
+        }
+    }
+
+    // read canonical table
+    void assignCodes() {
+        int p = 0;
+        uint8_t* cursym = &_symbol[0];
+        for (int i=_min_codelen; i <= _max_codelen; i++) {
+            int n = _codelen_count[i];
+            if (n) {
+                int shift = _max_codelen - i;
+                memset(_bits_to_len + p, i, n << shift);
+                int m = 1 << shift;
+                do {
+                    memset(_bits_to_sym + p, *cursym++, m);
+                    p += m;
+                } while (--n);
+            }
+        }
+    }
+
+    private:
+    BitReader& _reader;
+    int _num_symbols;
+    int _sym_bits;
+    int _min_codelen, _max_codelen;
+    int _codelen_count[kMaxHuffCodeLength];
+    uint8_t _bits_to_len[512];
+    uint8_t _bits_to_sym[512];
+    uint8_t _symbol_length[512];
+    uint8_t _symbol[512];
+};
+
 std::vector<uint8_t> read_file_into_buf(const std::string& fileName) {
     std::ifstream fileStream(fileName, std::ios::binary | std::ios::ate);  // Open the file in binary mode and set the position to end.
 
@@ -316,13 +445,27 @@ std::vector<uint8_t> read_file_into_buf(const std::string& fileName) {
     return buffer;
 }
 
-void test_huffman_encode_file(std::string filename) {
+void write_buf_into_file(std::vector<uint8_t>& buf, std::string outfile) {
+    std::ofstream fileStream(outfile, std::ios::binary);  // Open the file in binary mode.
+
+    if (!fileStream) {
+        throw std::runtime_error("Error opening file: " + outfile);
+    }
+
+    fileStream.write(reinterpret_cast<const char*>(buf.data()), static_cast<std::streamsize>(buf.size()));  // Write data from buffer to file.
+
+    if (fileStream.bad()) {
+        throw std::runtime_error("Error writing to file: " + outfile);
+    }
+}
+
+void test_huffman_encode_file(std::string filename, std::string outfile) {
 
     std::vector<uint8_t> buf = read_file_into_buf(filename);
     BitReader br(buf.data(), buf.data()+buf.size());
-    uint8_t* outbuf = new uint8_t[buf.size()];
-    // std::vector<uint8_t> outbuf(buf.size());
-    BitWriter bw(outbuf);
+    // uint8_t* outbuf = new uint8_t[buf.size()];
+    std::vector<uint8_t> outbuf(buf.size());
+    BitWriter bw(outbuf.data());
     HuffmanEncoder enc(bw);
 
     for (int i=0; i<buf.size(); i++) {
@@ -337,8 +480,29 @@ void test_huffman_encode_file(std::string filename) {
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(toc-tic);
 
     int n_bytes = bw.finish();
+    outbuf.resize(n_bytes);
+    write_buf_into_file(outbuf, outfile);
+
     std::cout << "Compressed " << buf.size() << " bytes to " << n_bytes << " bytes in " << duration.count() << " ms\n";
-    delete[] outbuf;
+}
+
+void test_huffman_decode_file(std::string filename, std::string outfile) {
+
+    std::vector<uint8_t> buf = read_file_into_buf(filename);
+    BitReader br(buf.data(), buf.data()+buf.size());
+    HuffmanDecoder dec(br);
+    std::vector<uint8_t> output(buf.size()*1.5);
+
+    auto tic = std::chrono::high_resolution_clock::now();
+    dec.readTable();
+    dec.assignCodes();
+    dec.decode(output.data(), output.data()+output.size());
+    auto toc = std::chrono::high_resolution_clock::now();
+    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(toc-tic);
+
+    write_buf_into_file(output, outfile);
+
+    std::cout << "Decompressed" << buf.size() << " bytes in " << duration.count() << " ms\n";
 }
 
 void test_huffman_encode() {
@@ -361,7 +525,7 @@ void test_huffman_encode() {
 
 int main(int argc, char** argv) {
 
-    test_huffman_encode_file(argv[1]);
+    test_huffman_decode_file(argv[1], argv[2]);
 
     return 0;
 }
